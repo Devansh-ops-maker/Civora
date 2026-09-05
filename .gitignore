@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+sih2026_venv/
+ENV/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Django
+*.log
+db.sqlite3
+db.sqlite3-journal
+media/
+staticfiles/
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# OS / temp
+Thumbs.db
+*.tmp
+*.temp
+
+# Node / frontend (if frontend is added in this repo)
+node_modules/
+dist/
+build/
+.npm/
+.yarn/
+.pnpm-store/
+
+# Coverage / test output
+.pytest_cache/
+htmlcov/
+coverage.xml
+
+# Local tooling / generated files
+*.pid
+*.seed
+
+# Archives / build artifacts
+*.zip
+*.tar
+*.tar.gz
