@@ -139,7 +139,13 @@ def _evidence_score(startup: Startup) -> float:
 
 def rank_startups(challenge: Challenge, limit: int = 10) -> list[dict]:
     if challenge.embedding is None:
-        raise OllamaError("Challenge embedding is missing. Generate it first.")
+        try:
+            update_challenge_embedding(challenge)
+        except OllamaError as exc:
+            raise OllamaError(
+                "Challenge embedding is missing and could not be generated automatically. "
+                "Ensure Ollama is running."
+            ) from exc
 
     candidates = (
         Startup.objects.select_related("user")

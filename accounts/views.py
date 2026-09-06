@@ -3,7 +3,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import GovernmentProfile, StartupProfile, UserType
+from .models import GovernmentProfile, StartupProfile, UserType, User
 from .serializers import (
     GovernmentProfileSerializer,
     LoginSerializer,
@@ -74,6 +74,17 @@ class MeView(APIView):
         if name:
             user.name = name
             user.save(update_fields=["name"])
+
+        # Allow updating preferred language (toggle en <-> hi)
+        preferred_language = request.data.get("preferred_language")
+        if preferred_language is not None:
+            # validate against model choices
+            allowed = {choice[0] for choice in User.LANGUAGE_CHOICES}
+            if preferred_language in allowed:
+                user.preferred_language = preferred_language
+                user.save(update_fields=["preferred_language"]) 
+            else:
+                return Response({"preferred_language": "Invalid value."}, status=status.HTTP_400_BAD_REQUEST)
 
         profile_data = request.data.get("profile")
         if profile_data and user.user_type == UserType.GOVERNMENT:

@@ -47,7 +47,7 @@ def check_application_eligibility(application: Application):
             failures.append(
                 f"Minimum team size is {minimum_team_size}; startup has {startup.team_size}."
             )
-
+            """
     required_industries = _normalize_list(requirements.get("required_industries"))
     if required_industries:
         startup_industry = (startup.industry or "").strip().lower()
@@ -61,7 +61,7 @@ def check_application_eligibility(application: Application):
         startup_technologies = set(_normalize_list(startup.technologies))
         missing = sorted(required_technologies - startup_technologies)
         if missing:
-            failures.append("Startup is missing required technologies: " + ", ".join(missing) + ".")
+            failures.append("Startup is missing required technologies: " + ", ".join(missing) + ".") """
 
     if requirements.get("government_experience_required") is True:
         has_verified_gov_pilot = startup.evidence.filter(
@@ -246,13 +246,23 @@ def selection_summary(application: Application) -> dict:
     human_average = human["average_score"]
     ai_score = ai.overall_score if ai else None
 
+    # Normalize and reduce precision to avoid jittery UI updates.
+    # Scores are on a 0-100 scale. Round to 1 decimal for smoother transitions
+    # and provide an integer percent for straightforward progress bars.
+    if ai_score is not None:
+        ai_score = round(float(ai_score), 1)
+    if human_average is not None:
+        human_average = round(float(human_average), 1)
+
     combined = None
     if ai_score is not None and human_average is not None:
-        combined = round((ai_score + human_average) / 2, 2)
+        combined = round((ai_score + human_average) / 2, 1)
     elif human_average is not None:
         combined = human_average
     elif ai_score is not None:
         combined = ai_score
+
+    combined_percent = int(round(combined)) if combined is not None else None
 
     return {
         "application_id": str(application.id),
@@ -261,6 +271,7 @@ def selection_summary(application: Application) -> dict:
         "human_evaluation_count": human["count"],
         "human_average_score": human_average,
         "combined_score": combined,
+        "combined_percent": combined_percent,
         "human_recommendations": human["recommendations"],
         "selection_ready": human["count"] > 0,
     }

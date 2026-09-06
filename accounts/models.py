@@ -67,6 +67,15 @@ class User(AbstractBaseUser, PermissionsMixin):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    LANGUAGE_CHOICES = (
+        ("en", "English"),
+        ("hi", "Hindi"),
+    )
+
+    preferred_language = models.CharField(
+        max_length=5, choices=LANGUAGE_CHOICES, default="en"
+    )
+
     objects = UserManager()
 
     USERNAME_FIELD = "email"

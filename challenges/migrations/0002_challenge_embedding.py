@@ -1,5 +1,5 @@
 from django.db import migrations
-from pgvector.django import HnswIndex, VectorField
+from pgvector.django import HnswIndex, VectorExtension, VectorField
 from django.conf import settings
 
 
@@ -9,6 +9,7 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        VectorExtension(),
         migrations.AddField(
             model_name="challenge",
             name="embedding",

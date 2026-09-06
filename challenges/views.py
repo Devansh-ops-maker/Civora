@@ -31,7 +31,20 @@ class ChallengeViewSet(viewsets.ModelViewSet):
         return queryset.filter(status="OPEN")
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        challenge = serializer.save(created_by=self.request.user)
+        try:
+            from intelligence.services import update_challenge_embedding
+            update_challenge_embedding(challenge)
+        except Exception:
+            pass
+
+    def perform_update(self, serializer):
+        challenge = serializer.save()
+        try:
+            from intelligence.services import update_challenge_embedding
+            update_challenge_embedding(challenge)
+        except Exception:
+            pass
 
     @action(detail=True, methods=["post"], url_path="transition")
     def transition(self, request, pk=None):

@@ -1,5 +1,7 @@
 import json
+import re
 from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError
 from django.utils import timezone
@@ -11,10 +13,103 @@ from .models import Milestone, Pilot
 
 
 def _parse_json(raw):
+    text = (raw or "").strip()
+    # Remove fenced code blocks if present
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        # drop first and last fence lines
+        if len(lines) >= 3:
+            text = "\n".join(lines[1:-1]).strip()
+
+    # Try to extract the first top-level JSON object in the text
+    match = re.search(r"({[\s\S]*})", text)
+    if match:
+        text = match.group(1)
+
     try:
-        return json.loads(raw)
+        return json.loads(text)
     except json.JSONDecodeError as exc:
         raise OllamaError("Ollama returned invalid JSON for the pilot plan.") from exc
+
+
+def _normalize_plan(data: dict) -> dict:
+    """Normalize types in the AI-generated plan and validate basic shapes.
+
+    Ensures numeric fields are converted to Decimal/int and clamps milestone due_days.
+    """
+    if not isinstance(data, dict):
+        raise OllamaError("Pilot plan must be a JSON object.")
+
+    required = [
+        "title",
+        "description",
+        "objectives",
+        "success_criteria",
+        "data_requirements",
+        "milestones",
+    ]
+    missing = [k for k in required if k not in data]
+    if missing:
+        raise OllamaError("Pilot plan is missing required fields: " + ", ".join(missing))
+
+    plan = dict(data)
+
+    # Budget: allow null, number, or numeric string
+    budget = plan.get("budget")
+    if budget in (None, "", "null"):
+        plan["budget"] = None
+    else:
+        try:
+            plan["budget"] = Decimal(str(budget))
+        except (InvalidOperation, TypeError):
+            raise OllamaError("Pilot plan 'budget' must be a number or null.")
+
+    # Duration days
+    try:
+        plan["duration_days"] = int(plan.get("duration_days", 90) or 90)
+    except (TypeError, ValueError):
+        raise OllamaError("Pilot plan 'duration_days' must be an integer number of days.")
+
+    duration = plan["duration_days"]
+
+    # Milestones normalization
+    normalized_milestones = []
+    milestones = plan.get("milestones") or []
+    if not isinstance(milestones, list):
+        raise OllamaError("Pilot plan 'milestones' must be an array.")
+    for item in milestones:
+        if not isinstance(item, dict):
+            raise OllamaError("Each milestone must be an object.")
+        title = str(item.get("title", "Pilot milestone"))[:255]
+        description = str(item.get("description", ""))
+        # amount default 0
+        try:
+            amount = Decimal(str(item.get("amount", 0) or 0))
+        except (InvalidOperation, TypeError):
+            raise OllamaError("Milestone 'amount' must be a numeric value.")
+        if amount < 0:
+            raise OllamaError("Milestone 'amount' cannot be negative.")
+        try:
+            due_day = int(item.get("due_day", duration) or duration)
+        except (TypeError, ValueError):
+            raise OllamaError("Milestone 'due_day' must be an integer.")
+        # clamp due_day between 0 and duration
+        due_day = max(0, min(due_day, duration))
+        normalized_milestones.append({
+            "title": title,
+            "description": description,
+            "amount": amount,
+            "due_day": due_day,
+        })
+
+    plan["milestones"] = normalized_milestones
+
+    # Ensure lists
+    plan["objectives"] = list(plan.get("objectives") or [])
+    plan["success_criteria"] = list(plan.get("success_criteria") or [])
+    plan["data_requirements"] = list(plan.get("data_requirements") or [])
+
+    return plan
 
 
 def generate_pilot_plan(application: Application) -> dict:
@@ -58,11 +153,9 @@ Return exactly this shape:
 """
     raw = generate_text(prompt)
     data = _parse_json(raw)
-    required = ["title", "description", "objectives", "success_criteria", "data_requirements", "milestones"]
-    missing = [key for key in required if key not in data]
-    if missing:
-        raise OllamaError("Pilot plan is missing required fields: " + ", ".join(missing))
-    return data
+    # Normalize types and validate plan contents
+    plan = _normalize_plan(data)
+    return plan
 
 
 def create_pilot_from_plan(application: Application, plan: dict, created_by) -> Pilot:
@@ -71,8 +164,16 @@ def create_pilot_from_plan(application: Application, plan: dict, created_by) -> 
     if Pilot.objects.filter(application=application).exists():
         raise ValidationError("A pilot already exists for this application.")
 
-    budget = plan.get("budget", application.challenge.budget)
+    # Expect a normalized plan (numbers as Decimal/int)
+    budget = plan.get("budget") if plan.get("budget") is not None else application.challenge.budget
     duration_days = int(plan.get("duration_days", 90))
+    # Ensure budget is Decimal or None
+    if budget is not None and not isinstance(budget, Decimal):
+        try:
+            budget = Decimal(str(budget))
+        except (InvalidOperation, TypeError):
+            raise ValidationError("Pilot budget must be a numeric value or null.")
+
     pilot = Pilot.objects.create(
         application=application,
         challenge=application.challenge,
@@ -87,10 +188,11 @@ def create_pilot_from_plan(application: Application, plan: dict, created_by) -> 
         success_criteria=plan.get("success_criteria", []),
         data_requirements=plan.get("data_requirements", []),
     )
+    # Validate model constraints
     pilot.full_clean()
 
     for item in plan.get("milestones", []):
-        amount = item.get("amount", 0)
+        amount = item.get("amount", Decimal(0))
         due_day = int(item.get("due_day", duration_days))
         Milestone.objects.create(
             pilot=pilot,

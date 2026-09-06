@@ -39,6 +39,11 @@ from .services import (
     create_pilot_from_plan, generate_pilot_plan, submit_milestone,
     run_pre_pilot_simulation, generate_risk_flags, compute_outcome_decision,
 )
+from rest_framework.views import APIView
+from rest_framework import status as drf_status
+from .models import Pilot
+from .serializers import PilotSerializer
+from .permissions import PilotPermission
 
 
 class PilotViewSet(viewsets.ModelViewSet):
@@ -212,10 +217,25 @@ class MilestoneViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.user_type == UserType.STARTUP:
-            return self.queryset.filter(pilot__startup__user=user)
-        if user.user_type == UserType.GOVERNMENT:
-            return self.queryset.filter(pilot__created_by=user)
-        return self.queryset.none()
+            qs = self.queryset.filter(pilot__startup__user=user)
+        elif user.user_type == UserType.GOVERNMENT:
+            qs = self.queryset.filter(pilot__created_by=user)
+        else:
+            return self.queryset.none()
+
+        # Optional `pilot` query parameter to narrow milestones to a specific pilot.
+        pilot_param = self.request.query_params.get("pilot")
+        if pilot_param:
+            # tolerate full URLs or paths being passed (frontend bug)
+            if isinstance(pilot_param, str) and (pilot_param.startswith("http://") or pilot_param.startswith("https://") or "/" in pilot_param):
+                pilot_param = pilot_param.rstrip("/").split("/")[-1]
+            try:
+                # filter by UUID string; invalid values will simply return empty queryset
+                qs = qs.filter(pilot__id=pilot_param)
+            except Exception:
+                return self.queryset.none()
+
+        return qs
 
     @drf_action(detail=True, methods=["post"], url_path="submit")
     def submit(self, request, pk=None):
@@ -327,3 +347,32 @@ class PilotEvidenceViewSet(viewsets.ReadOnlyModelViewSet):
             evidence.verified_at = timezone.now()
         evidence.save(update_fields=["verified", "verified_by", "verified_at"])
         return Response(PilotEvidenceSerializer(evidence).data)
+
+
+
+class ManagePilotView(APIView):
+    """Convenience endpoint for frontends that request manage page by query param.
+
+    GET /api/pilots/manage/?pilot_id=<uuid>
+    """
+    permission_classes = [permissions.IsAuthenticated, PilotPermission]
+
+    def get(self, request):
+        pilot_id = request.query_params.get("pilot_id")
+        if not pilot_id:
+            return Response({"detail": "pilot_id query parameter is required."}, status=drf_status.HTTP_400_BAD_REQUEST)
+
+        # Handle frontend bugs where a full URL or path is passed as pilot_id
+        # Examples observed in the wild: "http://localhost:5173/startup/pilots/<pilot_uuid>" or
+        # "/startup/pilots/<pilot_uuid>" — extract the trailing path segment as the UUID.
+        if isinstance(pilot_id, str) and (pilot_id.startswith("http://") or pilot_id.startswith("https://") or "/" in pilot_id):
+            # strip trailing slash
+            pilot_id_candidate = pilot_id.rstrip("/")
+            # take last path segment
+            pilot_id = pilot_id_candidate.split("/")[-1]
+        pilot = get_object_or_404(Pilot.objects.select_related("application", "challenge", "startup", "created_by"), id=pilot_id)
+        # object-level permission check
+        perm = PilotPermission()
+        if not perm.has_object_permission(request, self, pilot):
+            return Response({"detail": "You do not have permission to access this pilot."}, status=drf_status.HTTP_403_FORBIDDEN)
+        return Response(PilotSerializer(pilot).data)

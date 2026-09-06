@@ -7,3 +7,4 @@ python-dotenv>=1.0
 django-cors-headers>=4.4
 django-filter>=24.2
 requests>=2.32
+beautifulsoup4>=4.12

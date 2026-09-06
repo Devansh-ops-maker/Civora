@@ -3,12 +3,15 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 
+from intelligence.views import GovernmentSchemesView
+
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/auth/", include("accounts.urls")),
     path("api/startups/", include("startups.urls")),
     path("api/challenges/", include("challenges.urls")),
     path("api/applications/", include("evaluations.urls")),
+    path("api/schemes/", GovernmentSchemesView.as_view(), name="government-schemes"),
     path("api/radar/", include("intelligence.urls")),
     path("api/pilots/", include("pilots.urls")),
     path("api/trust-graph/", include("intelligence.trust_urls")),

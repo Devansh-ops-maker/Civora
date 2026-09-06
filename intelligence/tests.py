@@ -1,5 +1,12 @@
-from unittest.mock import patch
+import json
+import os
+import tempfile
+from io import StringIO
+from unittest.mock import MagicMock, patch
 
+import requests
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -9,6 +16,8 @@ from challenges.models import Challenge, ChallengeStatus
 from startups.models import Startup, StartupEvidence, EvidenceType
 
 from .ollama import OllamaError
+from .scrapers import StartupIndiaScraper, get_startup_schemes, get_startup_schemes_json
+from .scrapers.startup_india import _clean_list, _clean_text, _first, _normalize_scheme
 from .services import rank_startups
 
 
@@ -231,3 +240,392 @@ class TrustGraphAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["root"]["type"], "challenge")
         self.assertTrue(any(edge["relationship"] == "SELECTED_STARTUP" for edge in response.data["edges"]))
+
+
+SAMPLE_RAW_API_DATA = {
+    "status": "success",
+    "message": "OK",
+    "data": {
+        "searchResult": {
+            "Ministry of Agriculture": [
+                {
+                    "id": "agri-101",
+                    "schname": ["Agri-Tech Infrastructure Scheme"],
+                    "mname": ["Ministry of Agriculture"],
+                    "title": ["Ministry of Agriculture"],
+                    "brief": ["<p>Funding for <b>smart farming</b> equipment.</p>"],
+                    "benefits": ["Financial grant up to 25 Lakhs", "Free mentorship"],
+                    "benefitTags": ["Grant", "Mentorship"],
+                    "EligibilityCriteria": ["DPIIT recognised startups", "Agriculture sector"],
+                    "quantumSize": ["Up to 25 Lakhs"],
+                    "sector": ["Agriculture", "Agri-Tech"],
+                    "tenure": ["Active"],
+                    "notes": ["Apply before financial year end."],
+                    "linktoApplication": ["https://agri.gov.in/scheme101"],
+                }
+            ],
+            "Ministry of Electronics and IT": [
+                {
+                    "id": "meity-202",
+                    "schname": ["Digital India Innovation Fund"],
+                    "mname": None,
+                    "title": ["MeitY Initiatives"],
+                    "brief": ["Support for deep-tech and AI innovations."],
+                    "benefits": ["Equity investment"],
+                    "benefitTags": ["Investment"],
+                    "EligibilityCriteria": ["Tech startups"],
+                    "quantumSize": ["Up to 1 Crore"],
+                    "sector": ["Artificial Intelligence", "SaaS"],
+                    "tenure": ["Active"],
+                    "notes": None,
+                    "linktoApplication": ["https://meity.gov.in/diif"],
+                }
+            ],
+        }
+    },
+}
+
+
+class StartupIndiaScraperTests(TestCase):
+    def test_clean_text(self):
+        self.assertIsNone(_clean_text(None))
+        self.assertIsNone(_clean_text("   "))
+        self.assertEqual(
+            _clean_text("<p>Hello   <b>World</b>\n</p>"),
+            "Hello World",
+        )
+
+    def test_clean_list(self):
+        self.assertEqual(_clean_list(None), [])
+        self.assertEqual(_clean_list("null"), [])
+        self.assertEqual(_clean_list("undefined"), [])
+        self.assertEqual(_clean_list("single item"), ["single item"])
+        self.assertEqual(
+            _clean_list(["  Item 1  ", None, "<p>Item 2</p>", "   "]),
+            ["Item 1", "Item 2"],
+        )
+
+    def test_first(self):
+        self.assertIsNone(_first(None))
+        self.assertIsNone(_first([]))
+        self.assertEqual(_first(["First", "Second"]), "First")
+        self.assertEqual(_first("Direct String"), "Direct String")
+
+    def test_normalize_scheme(self):
+        raw = {
+            "id": "test-id",
+            "schname": ["<b>Test Scheme</b>"],
+            "mname": None,
+            "title": ["Parent Ministry"],
+            "brief": ["<p>Scheme brief description.</p>"],
+            "benefits": ["Benefit 1", "Benefit 2"],
+            "benefitTags": ["Financial"],
+            "EligibilityCriteria": ["Seed stage"],
+            "quantumSize": ["10L"],
+            "sector": ["FinTech"],
+            "tenure": ["Active"],
+            "notes": ["Important note"],
+            "linktoApplication": ["https://apply.gov.in"],
+        }
+        normalized = _normalize_scheme(raw, "Fallback Ministry")
+        self.assertEqual(normalized["id"], "test-id")
+        self.assertEqual(normalized["scheme_name"], "Test Scheme")
+        self.assertEqual(normalized["ministry"], "Parent Ministry")
+        self.assertEqual(normalized["source_group"], "Fallback Ministry")
+        self.assertEqual(normalized["brief"], "Scheme brief description.")
+        self.assertEqual(normalized["benefits"], ["Benefit 1", "Benefit 2"])
+        self.assertEqual(normalized["benefit_tags"], ["Financial"])
+        self.assertEqual(normalized["eligibility_criteria"], ["Seed stage"])
+        self.assertEqual(normalized["application_url"], "https://apply.gov.in")
+
+    def test_parse_schemes(self):
+        scraper = StartupIndiaScraper()
+        result = scraper.parse_schemes(SAMPLE_RAW_API_DATA)
+        self.assertIn("metadata", result)
+        self.assertIn("schemes", result)
+        self.assertEqual(result["metadata"]["scheme_count"], 2)
+        self.assertEqual(result["metadata"]["group_count"], 2)
+        schemes = result["schemes"]
+        self.assertEqual(len(schemes), 2)
+        # Verify alphabetical sorting by ministry ("meity" < "ministry")
+        self.assertEqual(schemes[0]["ministry"], "MeitY Initiatives")
+        self.assertEqual(schemes[1]["ministry"], "Ministry of Agriculture")
+
+    @patch("requests.get")
+    def test_get_startup_schemes_mocked(self, mock_get):
+        mock_response = MagicMock()
+        mock_response.json.return_value = SAMPLE_RAW_API_DATA
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+
+        data = get_startup_schemes(timeout=15)
+        self.assertEqual(data["metadata"]["scheme_count"], 2)
+        self.assertEqual(len(data["schemes"]), 2)
+        mock_get.assert_called_once()
+        self.assertEqual(mock_get.call_args.kwargs["timeout"], 15)
+
+    @patch("requests.get")
+    def test_get_startup_schemes_json(self, mock_get):
+        mock_response = MagicMock()
+        mock_response.json.return_value = SAMPLE_RAW_API_DATA
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+
+        json_str = get_startup_schemes_json()
+        parsed = json.loads(json_str)
+        self.assertIn("schemes", parsed)
+        self.assertEqual(len(parsed["schemes"]), 2)
+
+
+class ScrapeStartupSchemesCommandTests(TestCase):
+    @patch("intelligence.management.commands.scrape_startup_schemes.get_startup_schemes")
+    def test_command_stdout(self, mock_scrape):
+        mock_scrape.return_value = {
+            "metadata": {"scheme_count": 1, "group_count": 1},
+            "schemes": [
+                {"scheme_name": "Standup Scheme", "ministry": "Finance"}
+            ],
+        }
+        out = StringIO()
+        call_command("scrape_startup_schemes", stdout=out)
+        output = out.getvalue()
+        self.assertIn("Standup Scheme", output)
+        self.assertIn("Finance", output)
+
+    @patch("intelligence.management.commands.scrape_startup_schemes.get_startup_schemes")
+    def test_command_file_output(self, mock_scrape):
+        mock_scrape.return_value = {
+            "metadata": {"scheme_count": 1, "group_count": 1},
+            "schemes": [
+                {"scheme_name": "File Test Scheme", "ministry": "IT"}
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = os.path.join(tmpdir, "schemes.json")
+            out = StringIO()
+            call_command("scrape_startup_schemes", output=file_path, stdout=out)
+            self.assertTrue(os.path.exists(file_path))
+            with open(file_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(len(saved["schemes"]), 1)
+            self.assertEqual(saved["schemes"][0]["scheme_name"], "File Test Scheme")
+            self.assertIn("Successfully scraped 1 schemes", out.getvalue())
+
+    @patch("intelligence.management.commands.scrape_startup_schemes.get_startup_schemes")
+    def test_command_request_error(self, mock_scrape):
+        mock_scrape.side_effect = requests.RequestException("Network unreachable")
+        with self.assertRaises(CommandError) as ctx:
+            call_command("scrape_startup_schemes")
+        self.assertIn("Failed to scrape Startup India schemes", str(ctx.exception))
+
+
+class RadarSchemesAPITests(APITestCase):
+    def setUp(self):
+        from django.core.cache import cache
+        cache.clear()
+        self.startup_user = User.objects.create_user(
+            email="startup-radar-schemes@example.com",
+            password="strongpassword123",
+            name="Startup User",
+            user_type=UserType.STARTUP,
+        )
+        StartupProfile.objects.create(
+            user=self.startup_user,
+            company_name="SchemeStartup",
+            description="Testing schemes",
+            industry="Tech",
+            technologies=["Python"],
+            team_size=5,
+        )
+        self.gov_user = User.objects.create_user(
+            email="gov-radar-schemes@example.com",
+            password="strongpassword123",
+            name="Gov User",
+            user_type=UserType.GOVERNMENT,
+        )
+        GovernmentProfile.objects.create(
+            user=self.gov_user,
+            department_name="Department of Commerce",
+        )
+
+    def test_unauthenticated_schemes_denied(self):
+        response = self.client.get("/api/radar/schemes/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_government_user_forbidden(self):
+        self.client.force_authenticate(self.gov_user)
+        response = self.client.get("/api/radar/schemes/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @patch("intelligence.views.get_startup_schemes")
+    def test_startup_user_can_access_schemes(self, mock_scrape):
+        mock_scrape.return_value = {
+            "metadata": {
+                "source_page_url": "https://www.startupindia.gov.in/schemes",
+                "api_url": "https://api.startupindia.gov.in",
+                "scheme_count": 2,
+                "group_count": 2,
+            },
+            "schemes": [
+                {
+                    "scheme_name": "Agri Innovation",
+                    "ministry": "Ministry of Agriculture",
+                    "brief": "Agri tech funding",
+                    "benefit_tags": ["Grant"],
+                },
+                {
+                    "scheme_name": "Cyber Defense",
+                    "ministry": "Ministry of Defence",
+                    "brief": "Defense security startup fund",
+                    "benefit_tags": ["Defense"],
+                },
+            ],
+        }
+        self.client.force_authenticate(self.startup_user)
+        response = self.client.get("/api/radar/schemes/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["metadata"]["scheme_count"], 2)
+        self.assertEqual(len(response.data["schemes"]), 2)
+
+    @patch("intelligence.views.get_startup_schemes")
+    def test_filter_by_ministry(self, mock_scrape):
+        mock_scrape.return_value = {
+            "metadata": {"scheme_count": 2},
+            "schemes": [
+                {"scheme_name": "Scheme A", "ministry": "Ministry of Agriculture"},
+                {"scheme_name": "Scheme B", "ministry": "Ministry of Defence"},
+            ],
+        }
+        self.client.force_authenticate(self.startup_user)
+        response = self.client.get("/api/radar/schemes/?ministry=Agriculture")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["metadata"]["scheme_count"], 1)
+        self.assertEqual(response.data["schemes"][0]["scheme_name"], "Scheme A")
+
+    @patch("intelligence.views.get_startup_schemes")
+    def test_filter_by_search(self, mock_scrape):
+        mock_scrape.return_value = {
+            "metadata": {"scheme_count": 2},
+            "schemes": [
+                {"scheme_name": "Drone Surveillance", "ministry": "Ministry of Defence", "brief": "Security drones", "benefit_tags": ["Defense"]},
+                {"scheme_name": "Bio Fuel", "ministry": "Ministry of Energy", "brief": "Renewable fuel", "benefit_tags": ["Energy"]},
+            ],
+        }
+        self.client.force_authenticate(self.startup_user)
+        response = self.client.get("/api/radar/schemes/?search=drone")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["metadata"]["scheme_count"], 1)
+        self.assertEqual(response.data["schemes"][0]["scheme_name"], "Drone Surveillance")
+
+    def test_invalid_timeout_param(self):
+        self.client.force_authenticate(self.startup_user)
+        response = self.client.get("/api/radar/schemes/?timeout=invalid")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("timeout must be a positive integer", response.data["detail"])
+
+    @patch("intelligence.views.get_startup_schemes")
+    def test_upstream_request_error_returns_502(self, mock_scrape):
+        mock_scrape.side_effect = requests.RequestException("Connection timeout")
+        self.client.force_authenticate(self.startup_user)
+        response = self.client.get("/api/radar/schemes/")
+        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
+        self.assertIn("Failed to fetch schemes", response.data["detail"])
+
+
+class DirectGovernmentSchemesAPITests(APITestCase):
+    def setUp(self):
+        from django.core.cache import cache
+        cache.clear()
+        self.startup_user = User.objects.create_user(
+            email="startup-direct-schemes@example.com",
+            password="strongpassword123",
+            name="Startup Direct User",
+            user_type=UserType.STARTUP,
+        )
+        StartupProfile.objects.create(
+            user=self.startup_user,
+            company_name="DirectSchemeStartup",
+            description="Testing direct schemes",
+            industry="IT",
+            technologies=["Django"],
+            team_size=3,
+        )
+        self.gov_user = User.objects.create_user(
+            email="gov-direct-schemes@example.com",
+            password="strongpassword123",
+            name="Gov Direct User",
+            user_type=UserType.GOVERNMENT,
+        )
+        GovernmentProfile.objects.create(
+            user=self.gov_user,
+            department_name="Department of IT",
+        )
+
+    def test_direct_schemes_unauthenticated_denied(self):
+        response = self.client.get("/api/schemes/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_direct_schemes_government_forbidden(self):
+        self.client.force_authenticate(self.gov_user)
+        response = self.client.get("/api/schemes/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @patch("intelligence.views.get_startup_schemes")
+    def test_direct_schemes_startup_access_success(self, mock_scrape):
+        mock_scrape.return_value = {
+            "metadata": {"scheme_count": 1, "group_count": 1},
+            "schemes": [
+                {
+                    "scheme_name": "Direct Scheme",
+                    "ministry": "Ministry of Science",
+                    "brief": "R&D funding for startups",
+                    "sectors": ["DeepTech"],
+                    "benefit_tags": ["Grant"],
+                }
+            ],
+        }
+        self.client.force_authenticate(self.startup_user)
+        response = self.client.get("/api/schemes/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], "success")
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["schemes"][0]["scheme_name"], "Direct Scheme")
+        self.assertIn("results", response.data)
+        self.assertIn("metadata", response.data)
+
+    @patch("intelligence.views.get_startup_schemes")
+    def test_direct_schemes_format_array(self, mock_scrape):
+        mock_scrape.return_value = {
+            "metadata": {"scheme_count": 1},
+            "schemes": [{"scheme_name": "Direct Scheme"}],
+        }
+        self.client.force_authenticate(self.startup_user)
+        response = self.client.get("/api/schemes/?output=array")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(response.data, list)
+        self.assertEqual(response.data[0]["scheme_name"], "Direct Scheme")
+
+    @patch("intelligence.views.get_startup_schemes")
+    def test_direct_schemes_caching_and_refresh(self, mock_scrape):
+        mock_scrape.return_value = {
+            "metadata": {"scheme_count": 1},
+            "schemes": [{"scheme_name": "Cached Scheme"}],
+        }
+        self.client.force_authenticate(self.startup_user)
+        # First call fetches and caches
+        res1 = self.client.get("/api/schemes/")
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.assertFalse(res1.data["metadata"]["cached"])
+        self.assertEqual(mock_scrape.call_count, 1)
+
+        # Second call returns from cache
+        res2 = self.client.get("/api/schemes/")
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertTrue(res2.data["metadata"]["cached"])
+        self.assertEqual(mock_scrape.call_count, 1)
+
+        # Force refresh calls scraper again
+        res3 = self.client.get("/api/schemes/?refresh=true")
+        self.assertEqual(res3.status_code, status.HTTP_200_OK)
+        self.assertFalse(res3.data["metadata"]["cached"])
+        self.assertEqual(mock_scrape.call_count, 2)
